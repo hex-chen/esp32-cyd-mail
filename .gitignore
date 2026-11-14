@@ -1,0 +1,10 @@
+# 本地凭证，绝不提交
+firmware/include/wifi_config.h
+server/config.json
+
+# 构建产物 / 缓存
+firmware/.pio/
+firmware/lib/TFT_eSPI/examples/   # 35M 示例，编译用不到
+server/__pycache__/
+*.pyc
+.DS_Store

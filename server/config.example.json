@@ -1,0 +1,11 @@
+{
+  "imap_host": "imap.gmail.com",
+  "imap_port": 993,
+  "user": "your-address@gmail.com",
+  "app_password": "16位应用专用密码",
+  "proxy": "127.0.0.1:7890",
+  "fake_mode": true,
+  "imap_poll_seconds": 20,
+  "http_port": 8087,
+  "server_host": "192.168.31.136"
+}
