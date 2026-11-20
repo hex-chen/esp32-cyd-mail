@@ -20,6 +20,22 @@ import imap_source
 HERE = os.path.dirname(os.path.abspath(__file__))
 POLL_HINT = 15  # 告诉板子的轮询间隔（秒）
 
+# OTA 固件托管目录
+FW_DIR = os.path.join(HERE, "firmware")
+FW_JSON = os.path.join(FW_DIR, "fw.json")
+FW_BIN = os.path.join(FW_DIR, "firmware.bin")
+
+
+def fw_info():
+    """读取固件元信息；缺失时返回 version=0，板子不会触发升级。"""
+    try:
+        with open(FW_JSON, encoding="utf8") as f:
+            d = json.load(f)
+        d["available"] = os.path.exists(FW_BIN)
+        return d
+    except Exception:
+        return {"version": 0, "available": False}
+
 FAKE_MAILS = [
     {
         "sender": "GitHub",
@@ -167,6 +183,41 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Cache-Control", "no-store")
             self.end_headers()
             self.wfile.write(card)
+            return
+        if u.path == "/api/fw":
+            # OTA: 板子轮询时顺带查版本。用紧凑 JSON（冒号后无空格），
+            # 兼容旧版固件的简易 JSON 解析器。
+            info = fw_info()
+            if info.get("available") and info.get("version", 0) > 0:
+                body = ('{"version":%d,"size":%d,"md5":"%s"}' % (
+                    int(info["version"]), int(info["size"]),
+                    str(info["md5"]))).encode()
+            else:
+                body = b'{"version":0}'
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        if u.path == "/api/fw.bin":
+            # OTA: 下载固件二进制
+            if not os.path.exists(FW_BIN):
+                self._json({"error": "no firmware"}, 404)
+                return
+            size = os.path.getsize(FW_BIN)
+            self.send_response(200)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Length", str(size))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            with open(FW_BIN, "rb") as f:
+                while True:
+                    chunk = f.read(8192)
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
             return
         self._json({"error": "not found"}, 404)
 

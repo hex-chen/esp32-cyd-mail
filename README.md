@@ -4,8 +4,12 @@ CYD 一体板（ESP32-2432S028R，2.8" ILI9341）上的邮件提醒器。
 
 - 服务端在家里 Linux 服务器上轮询 Gmail IMAP，把最新邮件的**中文**发件人/主题用 Noto Sans CJK 渲染成 1bit 点阵
 - 板子走 WiFi 独立供电，每 15 秒拉一次点阵并贴图，板子不需要任何中文字库
-- 有新邮件 → 亮屏 10 秒 → 关背光（内容保留）
-- 按板载 BOOT(GPIO0) → 亮屏 20 秒查看；亮屏期间再按一次立即熄灭
+- 有新邮件 → 亮屏 10 秒 → 自动关背光（内容保留）
+- 本地环形缓存最近 5 封，BOOT(GPIO0) 三态操作：
+  - **灭屏短按** → 亮屏看邮件（VIEW 20 秒）
+  - **亮屏短按** → 循环切下一封（到最新一封后绕回），重置 20 秒
+  - **亮屏长按 ≥1 秒** → 立即熄屏
+- 支持 **OTA 远程升级**：板子每约 60 秒查一次服务端固件版本，有新版自动下载、MD5 校验、刷写、重启；刷写失败 bootloader 自动回滚
 
 ```
 Gmail IMAP --(代理 CONNECT)--> 服务器 mail_notify.py --(HTTP 点阵)--> CYD 板子
@@ -35,6 +39,37 @@ Gmail IMAP --(代理 CONNECT)--> 服务器 mail_notify.py --(HTTP 点阵)--> CYD
 响应体：4800 字节 1bit 位图，240×160，MSB first（bit7 = 最左像素），行优先，每行 30 字节。`1` 画白，`0` 保持深蓝背景。格式与 TFT_eSPI `drawBitmap()` 一致，也与 Pillow `Image.new("1").tobytes()` 一致。
 
 其他接口：`GET /api/health` 看状态；`POST /api/fake` 推一封假邮件（联调用）。
+
+OTA 接口（板子自动调用）：
+
+| 接口 | 返回 |
+|---|---|
+| `GET /api/fw` | 紧凑 JSON `{"version":N,"size":B,"md5":"..."}`；无固件时 `{"version":0}` |
+| `GET /api/fw.bin` | 固件二进制，长度与 `size` 一致 |
+
+版本号在 `firmware/platformio.ini` 的 `FW_VERSION` 宏。板子只在服务端版本 **大于** 本地版本时才升级。紧凑 JSON（冒号后无空格）是为兼容旧版固件的简易解析器。
+
+## OTA 升级流程
+
+首次需 USB 烧录一次带 OTA 的固件（bootstrap），之后永久免 USB。升级只改版本号，不用插线：
+
+```bash
+# 1. 改 firmware/platformio.ini 的 FW_VERSION，例如 4 -> 5
+# 2. 编译
+~/.platformio/penv/bin/pio run -d firmware -e cyd
+# 3. 上传固件 + 更新 fw.json（版本号与 FW_VERSION 一致）
+scp firmware/.pio/build/cyd/firmware.bin chen@192.168.31.136:~/mail-notify/firmware/
+ssh chen@192.168.31.136 'bash -s' <<'EOS'
+cd ~/mail-notify
+SZ=$(stat -c%s firmware/firmware.bin)
+MD5=$(md5sum firmware/firmware.bin | awk '{print $1}')
+printf '{"version":5,"size":%s,"md5":"%s"}' "$SZ" "$MD5" > firmware/fw.json
+EOS
+# 板子约 60 秒内自动检测 -> 下载 -> 校验 -> 刷写 -> 重启
+# 串口可见 [ota] 日志；新固件启动后调用 esp_ota_mark_app_valid_cancel_rollback() 确认
+```
+
+注意：`fw.json` 必须是**紧凑格式**（无空格），否则旧版板子解析不出 md5。分区表已含 app0/app1 双分区 + otadata，支持回滚。
 
 ## 服务端部署
 
