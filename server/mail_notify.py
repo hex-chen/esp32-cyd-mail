@@ -17,6 +17,9 @@ from urllib.parse import parse_qs, urlparse
 import card_render
 import imap_source
 
+HISTORY_LIMIT = 200       # 最多保留多少封历史
+HISTORY_REBUILD_SEC = 600 # 每 10 分钟全量重建一次历史
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 POLL_HINT = 15  # 告诉板子的轮询间隔（秒）
 
@@ -69,6 +72,7 @@ class State:
         self.cfg = cfg
         self.fake_mode = bool(cfg.get("fake_mode", True))
         self.lock = threading.Lock()
+        self.imap_lock = threading.Lock()   # 串行化 IMAP 连接，避免代理并发 SSL EOF
         self.seq = 0
         self.unread = 0
         self.card = card_render.render_empty()
@@ -77,6 +81,9 @@ class State:
         self.last_check = 0
         self.fake_index = 0
         self.source = None
+        # 历史邮件：列表按时间倒序（最新在前），每项是渲染好的位图 bytes
+        self.history = [card_render.render_empty()]
+        self.history_total = 1
         if not self.fake_mode:
             self.source = imap_source.GmailSource(cfg)
 
@@ -86,8 +93,24 @@ class State:
             self.unread = unread
             self.card = card_render.render_card(mail, unread)
             self.last_check = time.time()
+            self.history.insert(
+                0, card_render.render_card(mail, 0, "历史邮件 · BOOT 翻页")
+            )
+            self.history_total = len(self.history)
+            if self.history_total > HISTORY_LIMIT:
+                self.history = self.history[:HISTORY_LIMIT]
+                self.history_total = HISTORY_LIMIT
             print(f"[new] seq={self.seq} 未读={unread} "
                   f"主题={mail.get('subject','')[:40]}", flush=True)
+
+    def init_fake_history(self):
+        """假数据模式造几封历史，方便测翻页。"""
+        cards = [card_render.render_card(m, 0, "历史邮件 · BOOT 翻页")
+                 for m in FAKE_MAILS * 3]
+        cards.append(card_render.render_empty("历史邮件 · BOOT 翻页"))
+        with self.lock:
+            self.history = cards
+            self.history_total = len(cards)
 
     def push_fake(self):
         mail = FAKE_MAILS[self.fake_index % len(FAKE_MAILS)]
@@ -103,7 +126,8 @@ class State:
         interval = int(self.cfg.get("imap_poll_seconds", 20))
         while True:
             try:
-                info = self.source.check()
+                with self.imap_lock:
+                    info = self.source.check()
                 self.last_check = time.time()
                 self.last_error = ""
                 mid = info["mail_id"]
@@ -128,6 +152,48 @@ class State:
                 self.last_error = f"{type(exc).__name__}: {exc}"
                 print(f"[poll] 检测失败: {self.last_error}", flush=True)
             time.sleep(interval)
+
+    def rebuild_history(self):
+        """全量重建历史位图列表（后台调用）。返回是否成功。"""
+        if self.fake_mode:
+            return True
+        try:
+            with self.imap_lock:
+                mails, unread = self.source.fetch_all(limit=HISTORY_LIMIT)
+            cards = [card_render.render_card(m, 0, "历史邮件 · BOOT 翻页")
+                     for m in mails]
+            if not cards:
+                cards = [card_render.render_empty()]
+            with self.lock:
+                self.history = cards
+                self.history_total = len(cards)
+                self.unread = unread
+            print(f"[history] 重建完成 {len(cards)} 封", flush=True)
+            return True
+        except Exception as exc:
+            print(f"[history] 重建失败: {type(exc).__name__}: {exc}",
+                  flush=True)
+            return False
+
+    def history_loop(self):
+        """启动即重建一次，失败则重试；成功后定时重建。"""
+        imap_lock = getattr(self, "_imap_lock", None)
+        while True:
+            ok = self.rebuild_history()
+            if ok:
+                break
+            print("[history] 30 秒后重试", flush=True)
+            time.sleep(30)
+        while True:
+            time.sleep(HISTORY_REBUILD_SEC)
+            self.rebuild_history()
+
+    def history_card(self, idx):
+        """取第 idx 封（0=最新）；越界返回 None。"""
+        with self.lock:
+            if idx < 0 or idx >= len(self.history):
+                return None
+            return self.history[idx], len(self.history), self.unread
 
     def snapshot(self):
         with self.lock:
@@ -180,6 +246,36 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("X-New", str(is_new))
             self.send_header("X-Unread", str(unread))
             self.send_header("X-Poll", str(POLL_HINT))
+            self.send_header("X-Total", str(state.history_total))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(card)
+            return
+        if u.path == "/api/mail":
+            # 历史翻页：返回第 idx 封位图（0=最新）
+            q = parse_qs(u.query)
+            try:
+                idx = int(q.get("idx", ["0"])[0])
+            except ValueError:
+                idx = 0
+            got = state.history_card(idx)
+            if got is None:
+                body = b'{"error":"out of range","total":%d}' % state.history_total
+                self.send_response(404)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("X-Total", str(state.history_total))
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            card, total, unread = got
+            self.send_response(200)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Length", str(len(card)))
+            self.send_header("X-Index", str(idx))
+            self.send_header("X-Total", str(total))
+            self.send_header("X-Unread", str(unread))
             self.send_header("Cache-Control", "no-store")
             self.end_headers()
             self.wfile.write(card)
@@ -243,6 +339,10 @@ def main():
     cfg = load_config()
     state = State(cfg)
     threading.Thread(target=state.poll_loop, daemon=True).start()
+    if state.fake_mode:
+        state.init_fake_history()
+    else:
+        threading.Thread(target=state.history_loop, daemon=True).start()
     port = int(cfg.get("http_port", 8087))
     srv = ThreadingHTTPServer(("0.0.0.0", port), Handler)
     srv.state = state

@@ -62,6 +62,22 @@ class GmailSource:
         ph, _, pp = p.partition(":")
         self.proxy = {"host": ph or "127.0.0.1", "port": int(pp or 7890)}
 
+    @staticmethod
+    def _parse_header(raw_bytes):
+        msg = email.message_from_bytes(raw_bytes)
+        name, addr = parseaddr(_decode(msg.get("From", "")))
+        try:
+            date = parsedate_to_datetime(msg.get("Date", "")).strftime(
+                "%m-%d %H:%M"
+            )
+        except Exception:
+            date = ""
+        return {
+            "subject": _decode(msg.get("Subject", "")) or "(无主题)",
+            "sender": name or addr or "未知发件人",
+            "date": date,
+        }
+
     def check(self):
         """返回最新一封邮件的摘要，或 None（收件箱为空）。"""
         m = _ProxiedIMAP(self.host, self.port, self.proxy)
@@ -84,21 +100,65 @@ class GmailSource:
             _, raw = m.fetch(
                 str(last), "(BODY.PEEK[HEADER.FIELDS (SUBJECT FROM DATE)])"
             )
-            msg = email.message_from_bytes(raw[0][1])
-            name, addr = parseaddr(_decode(msg.get("From", "")))
+            info = self._parse_header(raw[0][1])
+            info.update({"mail_id": last, "unread": unread})
+            return info
+        finally:
             try:
-                date = parsedate_to_datetime(msg.get("Date", "")).strftime(
-                    "%m-%d %H:%M"
-                )
+                m.logout()
             except Exception:
-                date = ""
-            return {
-                "mail_id": last,
-                "unread": unread,
-                "subject": _decode(msg.get("Subject", "")) or "(无主题)",
-                "sender": name or addr or "未知发件人",
-                "date": date,
-            }
+                pass
+
+    def fetch_all(self, limit=200):
+        """批量拉全部邮件 header，按序号倒序（最新在前）。
+
+        返回 (mails, unread)。mails 元素含 mail_id + 摘要。
+        一次 FETCH 多个序号，避免 N 次往返。
+        """
+        m = _ProxiedIMAP(self.host, self.port, self.proxy)
+        try:
+            m.login(self.user, self.password)
+            status, data = m.select("INBOX", readonly=True)
+            if status != "OK":
+                raise RuntimeError("INBOX select 失败")
+
+            _, data = m.search(None, "ALL")
+            ids = [int(i) for i in data[0].split()]
+            _, data = m.search(None, "UNSEEN")
+            unread = len(data[0].split())
+            if not ids:
+                return [], unread
+
+            ids.sort(reverse=True)            # 最新序号在前
+            ids = ids[:limit]
+
+            # 批量 FETCH：一次取所有 header。imaplib 返回 [(meta, body), ...]
+            seq_set = b",".join(str(i).encode() for i in ids)
+            _, raw = m.fetch(
+                seq_set, "(BODY.PEEK[HEADER.FIELDS (SUBJECT FROM DATE)])"
+            )
+            # raw 里每个 (meta, body) 对应一封，顺序与 ids 一致
+            bodies = {}
+            for item in raw:
+                if (isinstance(item, tuple) and len(item) == 2
+                        and isinstance(item[0], bytes)
+                        and isinstance(item[1], bytes)):
+                    # meta 形如 b'123 (BODY[HEADER.FIELDS (...)] {456}'
+                    head = item[0].split(b" ", 1)[0]
+                    try:
+                        bodies[int(head)] = item[1]
+                    except ValueError:
+                        pass
+
+            mails = []
+            for mid in ids:
+                body = bodies.get(mid)
+                if body is None:
+                    continue
+                info = self._parse_header(body)
+                info["mail_id"] = mid
+                mails.append(info)
+            return mails, unread
         finally:
             try:
                 m.logout()

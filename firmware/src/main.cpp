@@ -1,14 +1,14 @@
 /* CYD (ESP32-2432S028R) 邮件提醒固件
  *
- * 每 15 秒向服务端拉一张 240x160 1bit 点阵卡片。
+ * 服务端持有全部历史邮件（按索引取），板子本地滑动窗口缓存 3 封。
  * 新邮件 -> 亮屏 10 秒 -> 自动关背光（内容保留）。
  *
  * BOOT(GPIO0) 交互：
- *   灭屏短按        -> 亮屏看最新一封，常亮不自动熄
- *   亮屏短按        -> 循环切下一封，常亮不自动熄
+ *   灭屏短按        -> 亮屏看邮件，常亮不自动熄
+ *   亮屏短按        -> 循环翻下一封历史邮件（全部历史），常亮不自动熄
  *   亮屏长按 >=1s   -> 立即熄屏
  * 只有新邮件（ALERT）和开机 splash 会到点自动熄屏。
- * 本地环形缓存最近 5 封位图；重启后只保留开机后收到的 + 最新一封。
+ * 翻到窗口外才向服务端请求该封（翻一封发一封），并预取下一封凑满 3 封缓存。
  */
 
 #include <Arduino.h>
@@ -34,17 +34,19 @@
 #define HOLD_MS    1000
 #define POLL_MS    15000
 #define HTTP_TIMEOUT_MS 6000
-#define CACHE_N    5
+#define WIN_N      3                             // 本地滑动窗口缓存封数
 
 TFT_eSPI tft = TFT_eSPI();
 static uint8_t card[CARD_BYTES];                 // 收包临时缓冲
-static uint8_t cards[CACHE_N][CARD_BYTES];       // 5 封位图环形缓存（24KB）
-static uint32_t cardSeq[CACHE_N];
-static uint8_t cardCnt = 0;                      // 已缓存封数
-static uint8_t cardHead = 0;                     // 最新一封的索引
-static int8_t viewPos = 0;                       // 0 = 最新
+// 滑动窗口：缓存当前及相邻的历史位图
+static uint8_t winBmp[WIN_N][CARD_BYTES];        // 3 封位图（14.4KB）
+static int32_t winIdx[WIN_N];                    // 每槽对应的历史索引，-1=空
+static int8_t winNext = 0;                       // 下一个写入槽（环形）
 
 static uint32_t lastSeq = 0;                     // 0 = 首次同步
+static int32_t histIdx = 0;                      // 当前查看的历史索引（0=最新）
+static int32_t histTotal = 1;                    // 服务端邮件总数
+static bool histLoaded = false;                  // 是否已拿到历史卡片
 static uint32_t pollEvery = POLL_MS;
 static uint32_t lastPoll = 0;
 static uint8_t pollCount = 0;                    // 每 4 次 poll 查一次 OTA
@@ -64,33 +66,39 @@ static void backlight(bool on) {
   Serial.printf("[screen] %s\n", on ? "ON" : "OFF");
 }
 
-static void store_card(uint32_t seq) {
-  cardHead = (cardHead + 1) % CACHE_N;
-  memcpy(cards[cardHead], card, CARD_BYTES);
-  cardSeq[cardHead] = seq;
-  if (cardCnt < CACHE_N) cardCnt++;
-  viewPos = 0;
+// 把索引 idx 的位图写进窗口缓存（环形覆盖最旧槽）
+static void win_put(int32_t idx, const uint8_t *bmp) {
+  winIdx[winNext] = idx;
+  memcpy(winBmp[winNext], bmp, CARD_BYTES);
+  winNext = (winNext + 1) % WIN_N;
+}
+
+// 查窗口里是否已有 idx，返回槽号或 -1
+static int win_find(int32_t idx) {
+  for (int i = 0; i < WIN_N; i++) {
+    if (winIdx[i] == idx) return i;
+  }
+  return -1;
 }
 
 static void draw_card() {
   tft.fillScreen(TFT_NAVY);
-  if (cardCnt == 0) {
+  int slot = win_find(histIdx);
+  if (slot < 0) {
     tft.setTextDatum(MC_DATUM);
     tft.setTextSize(2);
     tft.setTextColor(TFT_WHITE, TFT_NAVY);
-    tft.drawString("No mail", tft.width() / 2, tft.height() / 2);
+    tft.drawString("Loading...", tft.width() / 2, tft.height() / 2);
     return;
   }
-  uint8_t idx = (cardHead - viewPos + CACHE_N) % CACHE_N;
-  // 位图里的 1 画白，0 保持深蓝背景
-  tft.drawBitmap(0, (tft.height() - CARD_H) / 2, cards[idx],
+  tft.drawBitmap(0, (tft.height() - CARD_H) / 2, winBmp[slot],
                  CARD_W, CARD_H, TFT_WHITE);
   tft.setTextDatum(BC_DATUM);
   tft.setTextSize(1);
   tft.setTextColor(TFT_CYAN, TFT_NAVY);
   char line[64];
-  snprintf(line, sizeof(line), "mail %d/%d  seq %lu  tap:next hold:off",
-           viewPos + 1, cardCnt, (unsigned long)cardSeq[idx]);
+  snprintf(line, sizeof(line), "%d/%d  tap:next hold:off",
+           histIdx + 1, histTotal);
   tft.drawString(line, tft.width() / 2, tft.height() - 8);
 }
 
@@ -111,6 +119,56 @@ static void wifi_connect() {
   } else {
     Serial.println("[wifi] FAILED, will retry");
   }
+}
+
+// 从服务端取第 idx 封历史位图，写入窗口。返回是否成功。
+// show=true 时顺便把 histIdx 设为 idx（用于翻页后立即显示）。
+static bool fetch_mail(int32_t idx, bool show) {
+  // 不在这里卡 idx 上限：服务端会 404 兜底，且响应头能带回真实 X-Total
+  if (idx < 0 || WiFi.status() != WL_CONNECTED) return false;
+  WiFiClient c;
+  HTTPClient http;
+  http.setTimeout(HTTP_TIMEOUT_MS);
+  char url[160];
+  snprintf(url, sizeof(url), "http://%s:%d/api/mail?idx=%d",
+           SERVER_HOST, SERVER_PORT, (int)idx);
+  if (!http.begin(c, url)) return false;
+  int code = http.GET();
+  // 先取总数（404 时也有 X-Total），再判断状态
+  int total = http.header("X-Total").toInt();
+  if (total > 0) histTotal = total;
+  if (code != 200) { http.end(); return false; }
+  int rIdx = http.header("X-Index").toInt();
+  int len = http.getSize();
+  bool ok = false;
+  if (len == CARD_BYTES) {
+    WiFiClient *stream = http.getStreamPtr();
+    size_t got = 0;
+    uint32_t t0 = millis();
+    while (got < CARD_BYTES && millis() - t0 < HTTP_TIMEOUT_MS) {
+      size_t want = min((size_t)512, (size_t)(CARD_BYTES - got));
+      int n = stream->readBytes(card + got, want);
+      if (n <= 0) break;
+      got += n;
+    }
+    ok = (got == CARD_BYTES);
+  }
+  http.end();
+  if (ok) {
+    win_put(rIdx >= 0 ? rIdx : idx, card);
+    if (show) histIdx = idx;
+    Serial.printf("[mail] 取回 %d/%d%s\n", idx + 1, histTotal,
+                  show ? " (显示)" : " (预取)");
+  }
+  return ok;
+}
+
+// 确保 histIdx 及其相邻在窗口里（翻一封发一封，缓存3封）
+static void ensure_window() {
+  if (win_find(histIdx) < 0) fetch_mail(histIdx, false);
+  // 预取下一封（循环回绕）
+  int32_t nxt = (histIdx + 1) % histTotal;
+  if (win_find(nxt) < 0) fetch_mail(nxt, false);
 }
 
 // 极简 JSON 取值：从 body 里找 "key": 后面的数字/字符串
@@ -210,8 +268,8 @@ static void poll_server() {
 
   WiFiClient client;
   HTTPClient http;
-  const char *keys[] = {"X-Seq", "X-New", "X-Unread", "X-Poll"};
-  http.collectHeaders(keys, 4);
+  const char *keys[] = {"X-Seq", "X-New", "X-Unread", "X-Poll", "X-Total"};
+  http.collectHeaders(keys, 5);
   http.setTimeout(HTTP_TIMEOUT_MS);
 
   char url[160];
@@ -232,6 +290,8 @@ static void poll_server() {
   bool isNew = http.header("X-New").toInt() == 1;
   uint32_t unread = http.header("X-Unread").toInt();
   uint32_t hint = http.header("X-Poll").toInt();
+  int total = http.header("X-Total").toInt();
+  if (total > 0) histTotal = total;
   if (hint >= 5 && hint <= 300) pollEvery = hint * 1000;
   int len = http.getSize();
 
@@ -257,19 +317,29 @@ static void poll_server() {
 
   bool changed = (seq != lastSeq);
   lastSeq = seq;
-  Serial.printf("[poll] seq=%lu new=%d unread=%lu every=%lus\n",
+  Serial.printf("[poll] seq=%lu new=%d unread=%lu total=%d every=%lus\n",
                 (unsigned long)seq, isNew, (unsigned long)unread,
-                (unsigned long)(pollEvery / 1000));
+                histTotal, (unsigned long)(pollEvery / 1000));
 
-  if (changed || cardCnt == 0) store_card(seq);
+  // /api/card 返回的是最新一封，放进 histIdx=0
+  if (!histLoaded) {
+    win_put(0, card);
+    histIdx = 0;
+    histLoaded = true;
+  }
 
   if (isNew) {
+    // 新邮件：跳回最新，用刚收到的卡片
+    win_put(0, card);
+    histIdx = 0;
     mode = ALERT;
     modeUntil = millis() + ALERT_MS;
-    autoOff = true;                    // 新邮件亮 10 秒自动熄屏
+    autoOff = true;
     backlight(true);
     draw_card();
-  } else if (changed && mode != DARK) {
+    ensure_window();           // 后台补齐相邻
+  } else if (changed && histIdx == 0 && mode != DARK) {
+    win_put(0, card);
     draw_card();
   }
 }
@@ -283,7 +353,7 @@ static void report_event(const char *kind) {
   char url[180];
   snprintf(url, sizeof(url),
            "http://%s:%d/api/event?k=%s&pos=%d&cnt=%d&mode=%d",
-           SERVER_HOST, SERVER_PORT, kind, viewPos + 1, cardCnt, (int)mode);
+           SERVER_HOST, SERVER_PORT, kind, histIdx + 1, histTotal, (int)mode);
   if (http.begin(c, url)) { http.GET(); http.end(); }
 }
 
@@ -292,15 +362,17 @@ static void on_boot_short() {
   autoOff = false;                     // 手动亮屏不自动熄屏，只能长按关
   if (mode == DARK) {
     mode = VIEW;
-    viewPos = 0;
     backlight(true);
   } else {
-    if (cardCnt > 1) viewPos = (viewPos + 1) % cardCnt;
+    // 循环回绕翻下一封
+    histIdx = (histIdx + 1) % histTotal;
     mode = VIEW;
   }
+  // 窗口没有就直接取（有短暂 Loading），取回后显示
+  if (win_find(histIdx) < 0) fetch_mail(histIdx, true);
   draw_card();
-  Serial.printf("[boot] tap -> VIEW %d/%d (stay on)\n",
-                viewPos + 1, cardCnt);
+  ensure_window();                     // 缓存当前+下一封
+  Serial.printf("[boot] tap -> %d/%d (stay on)\n", histIdx + 1, histTotal);
 }
 
 static void on_boot_long() {
@@ -343,7 +415,8 @@ void setup() {
   autoOff = true;
   backlight(true);
   lastPoll = millis();
-  poll_server();  // 首次同步：seen=0，服务端不会判成新邮件
+  poll_server();      // 首次同步：seen=0，服务端不会判成新邮件
+  ensure_window();    // 预取下一封，凑满 3 封窗口
 }
 
 void loop() {
