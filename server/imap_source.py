@@ -110,7 +110,7 @@ class GmailSource:
                 pass
 
     def fetch_all(self, limit=200):
-        """批量拉全部邮件 header，按序号倒序（最新在前）。
+        """批量拉未读邮件 header，按序号倒序（最新在前）。
 
         返回 (mails, unread)。mails 元素含 mail_id + 摘要。
         一次 FETCH 多个序号，避免 N 次往返。
@@ -122,10 +122,9 @@ class GmailSource:
             if status != "OK":
                 raise RuntimeError("INBOX select 失败")
 
-            _, data = m.search(None, "ALL")
-            ids = [int(i) for i in data[0].split()]
             _, data = m.search(None, "UNSEEN")
-            unread = len(data[0].split())
+            ids = [int(i) for i in data[0].split()]
+            unread = len(ids)
             if not ids:
                 return [], unread
 
@@ -159,6 +158,44 @@ class GmailSource:
                 info["mail_id"] = mid
                 mails.append(info)
             return mails, unread
+        finally:
+            try:
+                m.logout()
+            except Exception:
+                pass
+
+    def mark_read(self, mail_id):
+        """把指定序号的邮件标记为已读（\\Seen）。返回是否成功。"""
+        m = _ProxiedIMAP(self.host, self.port, self.proxy)
+        try:
+            m.login(self.user, self.password)
+            status, _ = m.select("INBOX", readonly=False)
+            if status != "OK":
+                raise RuntimeError("INBOX select 失败")
+            status, _ = m.store(str(mail_id), "+FLAGS", "(\\Seen)")
+            return status == "OK"
+        finally:
+            try:
+                m.logout()
+            except Exception:
+                pass
+
+    def mark_all_read(self):
+        """把所有未读标记为已读。返回标记数量。"""
+        m = _ProxiedIMAP(self.host, self.port, self.proxy)
+        try:
+            m.login(self.user, self.password)
+            status, _ = m.select("INBOX", readonly=False)
+            if status != "OK":
+                raise RuntimeError("INBOX select 失败")
+            _, data = m.search(None, "UNSEEN")
+            ids = data[0].split()
+            if not ids:
+                return 0
+            # 批量 STORE，一次标记所有
+            seq_set = b",".join(ids)
+            status, _ = m.store(seq_set.decode(), "+FLAGS", "(\\Seen)")
+            return len(ids) if status == "OK" else 0
         finally:
             try:
                 m.logout()

@@ -5,7 +5,8 @@
  *
  * BOOT(GPIO0) 交互：
  *   灭屏短按        -> 亮屏看邮件，常亮不自动熄
- *   亮屏短按        -> 循环翻下一封历史邮件（全部历史），常亮不自动熄
+ *   亮屏短按        -> 循环翻下一封未读邮件，常亮不自动熄
+ *   双击(350ms内两次) -> 标记当前封已读（服务端 IMAP \Seen），从列表移除
  *   亮屏长按 >=1s   -> 立即熄屏
  * 只有新邮件（ALERT）和开机 splash 会到点自动熄屏。
  * 翻到窗口外才向服务端请求该封（翻一封发一封），并预取下一封凑满 3 封缓存。
@@ -32,6 +33,7 @@
 #define ALERT_MS   10000
 #define VIEW_MS    20000
 #define HOLD_MS    1000
+#define DOUBLE_MS  350                 // 双击判定窗口
 #define POLL_MS    15000
 #define HTTP_TIMEOUT_MS 6000
 #define WIN_N      3                             // 本地滑动窗口缓存封数
@@ -60,6 +62,9 @@ static bool lastBoot = HIGH;
 static bool pressing = false;
 static uint32_t pressAt = 0;
 static bool longFired = false;
+static bool tapPending = false;          // 短按已松开，等待可能的第二下
+static uint32_t tapAt = 0;
+static uint32_t toastUntil = 0;          // >0 表示正在显示提示，到点重绘卡片
 
 static void backlight(bool on) {
   digitalWrite(BL_PIN, on ? HIGH : LOW);
@@ -370,6 +375,65 @@ static void report_event(const char *kind) {
   if (http.begin(c, url)) { http.GET(); http.end(); }
 }
 
+// 双击：请求服务端把当前封标已读，成功后从窗口移除并显示下一封
+static void on_boot_double() {
+  report_event("double");
+  if (WiFi.status() != WL_CONNECTED || histTotal <= 1) {
+    // 空列表：友好提示，不当失败
+    tft.fillScreen(TFT_NAVY);
+    tft.setTextDatum(MC_DATUM);
+    tft.setTextSize(2);
+    tft.setTextColor(TFT_WHITE, TFT_NAVY);
+    tft.drawString("No unread mail", tft.width() / 2, tft.height() / 2);
+    toastUntil = millis() + 1200;
+    Serial.println("[boot] double 空列表");
+    return;
+  }
+  WiFiClient c;
+  HTTPClient http;
+  http.setTimeout(4000);
+  char url[160];
+  snprintf(url, sizeof(url), "http://%s:%d/api/read?idx=%d",
+           SERVER_HOST, SERVER_PORT, (int)histIdx);
+  bool ok = false;
+  int total = histTotal;
+  if (http.begin(c, url)) {
+    int code = http.GET();
+    if (code == 200) {
+      String body = http.getString();
+      ok = json_int(body, "ok") == 1;
+      int t = json_int(body, "total");
+      if (t > 0) total = t;
+    }
+    http.end();
+  }
+  if (ok) {
+    // 服务端已删该封：窗口清掉，索引不前进（下一封顶上来）
+    int slot = win_find(histIdx);
+    if (slot >= 0) winIdx[slot] = -1;
+    histTotal = total;
+    if (histIdx >= histTotal) histIdx = 0;
+    // 清窗口里失效的索引
+    for (int i = 0; i < WIN_N; i++) {
+      if (winIdx[i] >= histTotal) winIdx[i] = -1;
+    }
+    // 显示"已读"提示 1.2 秒
+    tft.fillScreen(TFT_NAVY);
+    tft.setTextDatum(MC_DATUM);
+    tft.setTextSize(2);
+    tft.setTextColor(TFT_WHITE, TFT_NAVY);
+    tft.drawString("Marked read", tft.width() / 2, tft.height() / 2);
+    Serial.printf("[boot] double -> read %d, total=%d\n", histIdx + 1, total);
+    if (win_find(histIdx) < 0) fetch_mail(histIdx, true);
+    ensure_window();
+    backlight(true);
+    toastUntil = millis() + 1200;   // 提示 1.2 秒后重绘卡片（不熄屏）
+  } else {
+    Serial.printf("[boot] double 标已读失败 idx=%d\n", histIdx);
+    draw_card();
+  }
+}
+
 static void on_boot_short() {
   report_event("tap");
   autoOff = false;                     // 手动亮屏不自动熄屏，只能长按关
@@ -443,18 +507,38 @@ void loop() {
       pressing = true;
       pressAt = millis();
       longFired = false;
+      // 第二次按下且在双击窗口内 -> 双击，取消待处理的单击
+      if (tapPending && (millis() - tapAt) <= DOUBLE_MS) {
+        tapPending = false;
+        on_boot_double();
+      }
     }
   }
   // 按住达阈值：亮屏状态下长按立即熄屏
   if (pressing && !longFired && mode != DARK && (millis() - pressAt >= HOLD_MS)) {
     on_boot_long();
   }
-  // 上升沿：松开（未触发长按则视为短按）
+  // 上升沿：松开（未触发长按则挂起单击，等 350ms 看有没有第二下）
   if (lastBoot == LOW && b == HIGH && pressing) {
     pressing = false;
-    if (!longFired) on_boot_short();
+    if (!longFired) {
+      tapPending = true;
+      tapAt = millis();
+    }
   }
   lastBoot = b;
+
+  // 单击超时：没等到第二下，执行翻页
+  if (tapPending && (millis() - tapAt) > DOUBLE_MS) {
+    tapPending = false;
+    on_boot_short();
+  }
+
+  // 已读提示到点：重绘卡片（保持亮屏）
+  if (toastUntil > 0 && (int32_t)(millis() - toastUntil) >= 0) {
+    toastUntil = 0;
+    draw_card();
+  }
 
   if (mode != DARK && autoOff && (int32_t)(millis() - modeUntil) >= 0) {
     mode = DARK;

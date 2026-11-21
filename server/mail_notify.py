@@ -81,9 +81,12 @@ class State:
         self.last_check = 0
         self.fake_index = 0
         self.source = None
-        # 历史邮件：列表按时间倒序（最新在前），每项是渲染好的位图 bytes
-        self.history = [card_render.render_empty()]
-        self.history_total = 1
+        # 未读邮件列表：按时间倒序（最新在前）
+        # history[i] = 渲染好的位图 bytes；history_ids[i] = 对应 IMAP 序号
+        empty = card_render.render_empty("暂无未读邮件 · BOOT 双击标已读")
+        self.history = [empty]
+        self.history_ids = [0]          # 0 = 无对应邮件（空列表占位）
+        self.history_total = 1          # 最小 1：空列表也返回一张提示卡
         if not self.fake_mode:
             self.source = imap_source.GmailSource(cfg)
 
@@ -94,8 +97,13 @@ class State:
             self.card = card_render.render_card(mail, unread)
             self.last_check = time.time()
             self.history.insert(
-                0, card_render.render_card(mail, 0, "历史邮件 · BOOT 翻页")
+                0, card_render.render_card(mail, 0, "BOOT 双击标已读")
             )
+            self.history_ids.insert(0, mail.get("mail_id", 0))
+            if self.history_ids[0] == 0 and len(self.history) > 1:
+                # 移除空列表占位卡
+                self.history.pop()
+                self.history_ids.pop()
             self.history_total = len(self.history)
             if self.history_total > HISTORY_LIMIT:
                 self.history = self.history[:HISTORY_LIMIT]
@@ -105,16 +113,18 @@ class State:
 
     def init_fake_history(self):
         """假数据模式造几封历史，方便测翻页。"""
-        cards = [card_render.render_card(m, 0, "历史邮件 · BOOT 翻页")
-                 for m in FAKE_MAILS * 3]
-        cards.append(card_render.render_empty("历史邮件 · BOOT 翻页"))
         with self.lock:
-            self.history = cards
-            self.history_total = len(cards)
+            self.history = [
+                card_render.render_card(m, 0, "BOOT 双击标已读")
+                for m in FAKE_MAILS * 3
+            ]
+            self.history_ids = list(range(1, len(self.history) + 1))
+            self.history_total = len(self.history)
 
     def push_fake(self):
-        mail = FAKE_MAILS[self.fake_index % len(FAKE_MAILS)]
+        mail = dict(FAKE_MAILS[self.fake_index % len(FAKE_MAILS)])
         self.fake_index += 1
+        mail["mail_id"] = 900000 + self.fake_index   # 假 id，供双击标记测试
         self.publish(mail, self.fake_index)
         return mail
 
@@ -160,12 +170,15 @@ class State:
         try:
             with self.imap_lock:
                 mails, unread = self.source.fetch_all(limit=HISTORY_LIMIT)
-            cards = [card_render.render_card(m, 0, "历史邮件 · BOOT 翻页")
+            cards = [card_render.render_card(m, 0, "BOOT 双击标已读")
                      for m in mails]
+            ids = [m["mail_id"] for m in mails]
             if not cards:
-                cards = [card_render.render_empty()]
+                cards = [card_render.render_empty("暂无未读邮件 · BOOT 双击标已读")]
+                ids = [0]
             with self.lock:
                 self.history = cards
+                self.history_ids = ids
                 self.history_total = len(cards)
                 self.unread = unread
             print(f"[history] 重建完成 {len(cards)} 封", flush=True)
@@ -194,6 +207,52 @@ class State:
             if idx < 0 or idx >= len(self.history):
                 return None
             return self.history[idx], len(self.history), self.unread
+
+    def mark_read_idx(self, idx):
+        """把第 idx 封标已读并从列表移除。返回 (ok, new_total)。"""
+        with self.lock:
+            if idx < 0 or idx >= len(self.history_ids):
+                return False, self.history_total
+            mid = self.history_ids[idx]
+        if mid == 0:
+            return False, self.history_total
+        if self.fake_mode:
+            ok = True
+        else:
+            with self.imap_lock:
+                ok = self.source.mark_read(mid)
+        if ok:
+            with self.lock:
+                # 索引可能已变，用 mid 精确查找
+                for i, m in enumerate(self.history_ids):
+                    if m == mid:
+                        self.history.pop(i)
+                        self.history_ids.pop(i)
+                        break
+                if not self.history:
+                    self.history = [card_render.render_empty(
+                        "暂无未读邮件 · BOOT 双击标已读")]
+                    self.history_ids = [0]
+                self.history_total = len(self.history)
+                self.unread = max(0, self.unread - 1)
+        return ok, self.history_total
+
+    def mark_all_read(self):
+        """全部标已读。返回标记数量。"""
+        if self.fake_mode:
+            n = max(0, self.history_total - 1)
+            with self.lock:
+                self.history = [card_render.render_empty(
+                    "暂无未读邮件 · BOOT 双击标已读")]
+                self.history_ids = [0]
+                self.history_total = 1
+                self.unread = 0
+            return n
+        with self.imap_lock:
+            n = self.source.mark_all_read()
+        # 全标后重建历史（会变成空列表提示卡）
+        self.rebuild_history()
+        return n
 
     def snapshot(self):
         with self.lock:
@@ -279,6 +338,24 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Cache-Control", "no-store")
             self.end_headers()
             self.wfile.write(card)
+            return
+        if u.path == "/api/read":
+            # 双击标记已读：标 IMAP \Seen 并从历史移除
+            q = parse_qs(u.query)
+            try:
+                idx = int(q.get("idx", ["-1"])[0])
+            except ValueError:
+                idx = -1
+            ok, total = state.mark_read_idx(idx)
+            print(f"[read] idx={idx} ok={ok} total={total}", flush=True)
+            self._json({"ok": ok, "total": total})
+            return
+        if u.path == "/api/read/all":
+            # 全部标已读
+            n = state.mark_all_read()
+            print(f"[read] 全部标已读 {n} 封", flush=True)
+            self._json({"ok": True, "marked": n,
+                        "total": state.history_total})
             return
         if u.path == "/api/event":
             # 板子按键上报，方便免 USB 诊断
