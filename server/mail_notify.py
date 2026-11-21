@@ -184,6 +184,13 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(card)
             return
+        if u.path == "/api/event":
+            # 板子按键上报，方便免 USB 诊断
+            q = parse_qs(u.query)
+            print("[event] " + " ".join(
+                f"{k}={v[0]}" for k, v in q.items()), flush=True)
+            self._json({"ok": True})
+            return
         if u.path == "/api/fw":
             # OTA: 板子轮询时顺带查版本。用紧凑 JSON（冒号后无空格），
             # 兼容旧版固件的简易 JSON 解析器。

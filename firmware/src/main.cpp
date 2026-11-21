@@ -274,7 +274,21 @@ static void poll_server() {
   }
 }
 
+// 按键上报：免 USB 诊断用，短超时不阻塞太久
+static void report_event(const char *kind) {
+  if (WiFi.status() != WL_CONNECTED) return;
+  WiFiClient c;
+  HTTPClient http;
+  http.setTimeout(1000);
+  char url[180];
+  snprintf(url, sizeof(url),
+           "http://%s:%d/api/event?k=%s&pos=%d&cnt=%d&mode=%d",
+           SERVER_HOST, SERVER_PORT, kind, viewPos + 1, cardCnt, (int)mode);
+  if (http.begin(c, url)) { http.GET(); http.end(); }
+}
+
 static void on_boot_short() {
+  report_event("tap");
   autoOff = false;                     // 手动亮屏不自动熄屏，只能长按关
   if (mode == DARK) {
     mode = VIEW;
@@ -290,6 +304,7 @@ static void on_boot_short() {
 }
 
 static void on_boot_long() {
+  report_event("hold");
   longFired = true;
   mode = DARK;
   autoOff = false;
