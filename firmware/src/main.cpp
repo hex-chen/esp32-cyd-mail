@@ -4,10 +4,10 @@
  * 新邮件 -> 亮屏 10 秒 -> 自动关背光（内容保留）。
  *
  * BOOT(GPIO0) 交互：
- *   灭屏短按        -> 亮屏看最新一封（VIEW 20s）
- *   亮屏短按        -> 循环切下一封，并重置 20s
+ *   灭屏短按        -> 亮屏看最新一封，常亮不自动熄
+ *   亮屏短按        -> 循环切下一封，常亮不自动熄
  *   亮屏长按 >=1s   -> 立即熄屏
- *
+ * 只有新邮件（ALERT）和开机 splash 会到点自动熄屏。
  * 本地环形缓存最近 5 封位图；重启后只保留开机后收到的 + 最新一封。
  */
 
@@ -52,6 +52,7 @@ static uint8_t pollCount = 0;                    // 每 4 次 poll 查一次 OTA
 enum Mode { DARK, ALERT, VIEW };
 static Mode mode = DARK;
 static uint32_t modeUntil = 0;
+static bool autoOff = false;                     // true=到点自动熄屏（新邮件/开机splash）
 
 static bool lastBoot = HIGH;
 static bool pressing = false;
@@ -265,6 +266,7 @@ static void poll_server() {
   if (isNew) {
     mode = ALERT;
     modeUntil = millis() + ALERT_MS;
+    autoOff = true;                    // 新邮件亮 10 秒自动熄屏
     backlight(true);
     draw_card();
   } else if (changed && mode != DARK) {
@@ -273,6 +275,7 @@ static void poll_server() {
 }
 
 static void on_boot_short() {
+  autoOff = false;                     // 手动亮屏不自动熄屏，只能长按关
   if (mode == DARK) {
     mode = VIEW;
     viewPos = 0;
@@ -281,15 +284,15 @@ static void on_boot_short() {
     if (cardCnt > 1) viewPos = (viewPos + 1) % cardCnt;
     mode = VIEW;
   }
-  modeUntil = millis() + VIEW_MS;
   draw_card();
-  Serial.printf("[boot] tap -> VIEW %d/%d (%lus)\n",
-                viewPos + 1, cardCnt, VIEW_MS / 1000);
+  Serial.printf("[boot] tap -> VIEW %d/%d (stay on)\n",
+                viewPos + 1, cardCnt);
 }
 
 static void on_boot_long() {
   longFired = true;
   mode = DARK;
+  autoOff = false;
   backlight(false);
   Serial.println("[boot] HOLD -> DARK");
 }
@@ -322,6 +325,7 @@ void setup() {
   // 开机亮 3 秒显示启动信息，之后进入黑屏待机
   mode = VIEW;
   modeUntil = millis() + 3000;
+  autoOff = true;
   backlight(true);
   lastPoll = millis();
   poll_server();  // 首次同步：seen=0，服务端不会判成新邮件
@@ -351,8 +355,9 @@ void loop() {
   }
   lastBoot = b;
 
-  if (mode != DARK && (int32_t)(millis() - modeUntil) >= 0) {
+  if (mode != DARK && autoOff && (int32_t)(millis() - modeUntil) >= 0) {
     mode = DARK;
+    autoOff = false;
     backlight(false);
     Serial.println("[screen] timeout -> DARK");
   }
