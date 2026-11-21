@@ -40,7 +40,7 @@ TFT_eSPI tft = TFT_eSPI();
 static uint8_t card[CARD_BYTES];                 // 收包临时缓冲
 // 滑动窗口：缓存当前及相邻的历史位图
 static uint8_t winBmp[WIN_N][CARD_BYTES];        // 3 封位图（14.4KB）
-static int32_t winIdx[WIN_N];                    // 每槽对应的历史索引，-1=空
+static int32_t winIdx[WIN_N] = {-1, -1, -1};     // 每槽对应的历史索引，-1=空（必须初始化！）
 static int8_t winNext = 0;                       // 下一个写入槽（环形）
 
 static uint32_t lastSeq = 0;                     // 0 = 首次同步
@@ -85,6 +85,8 @@ static void draw_card() {
   tft.fillScreen(TFT_NAVY);
   int slot = win_find(histIdx);
   if (slot < 0) {
+    Serial.printf("[draw] Loading! histIdx=%d total=%d win=[%d,%d,%d]\n",
+                  histIdx, histTotal, winIdx[0], winIdx[1], winIdx[2]);
     tft.setTextDatum(MC_DATUM);
     tft.setTextSize(2);
     tft.setTextColor(TFT_WHITE, TFT_NAVY);
@@ -129,17 +131,28 @@ static bool fetch_mail(int32_t idx, bool show) {
   WiFiClient c;
   HTTPClient http;
   http.setTimeout(HTTP_TIMEOUT_MS);
+  const char *fk[] = {"X-Index", "X-Total"};
+  http.collectHeaders(fk, 2);
   char url[160];
   snprintf(url, sizeof(url), "http://%s:%d/api/mail?idx=%d",
            SERVER_HOST, SERVER_PORT, (int)idx);
-  if (!http.begin(c, url)) return false;
+  if (!http.begin(c, url)) {
+    Serial.printf("[mail] idx=%d begin 失败\n", idx);
+    return false;
+  }
   int code = http.GET();
   // 先取总数（404 时也有 X-Total），再判断状态
   int total = http.header("X-Total").toInt();
   if (total > 0) histTotal = total;
-  if (code != 200) { http.end(); return false; }
-  int rIdx = http.header("X-Index").toInt();
+  if (code != 200) {
+    Serial.printf("[mail] idx=%d HTTP %d\n", idx, code);
+    http.end(); return false;
+  }
+  // 不用 http.header("X-Index")：HTTPClient 没 collectHeaders 时读不到，
+  // 会返回 0 导致所有卡存进同一个槽。请求哪封就存哪封，最可靠。
+  int rIdx = idx;
   int len = http.getSize();
+  Serial.printf("[mail] idx=%d 响应 len=%d rIdx=%d\n", idx, len, rIdx);
   bool ok = false;
   if (len == CARD_BYTES) {
     WiFiClient *stream = http.getStreamPtr();
