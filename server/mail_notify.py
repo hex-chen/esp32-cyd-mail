@@ -256,7 +256,9 @@ class State:
 
     def snapshot(self):
         with self.lock:
-            return self.seq, self.unread, self.card
+            # card 始终反映当前最新未读（history[0]），空列表则是"暂无未读"卡
+            card = self.history[0] if self.history else self.card
+            return self.seq, self.unread, card
 
 
 class Handler(BaseHTTPRequestHandler):

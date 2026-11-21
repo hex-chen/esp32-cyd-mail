@@ -46,6 +46,7 @@ static int32_t winIdx[WIN_N] = {-1, -1, -1};     // 每槽对应的历史索引�
 static int8_t winNext = 0;                       // 下一个写入槽（环形）
 
 static uint32_t lastSeq = 0;                     // 0 = 首次同步
+static uint32_t lastUnread = 0xFFFFFFFF;         // 上次未读数，变化则刷新卡片
 static int32_t histIdx = 0;                      // 当前查看的历史索引（0=最新）
 static int32_t histTotal = 1;                    // 服务端邮件总数
 static bool histLoaded = false;                  // 是否已拿到历史卡片
@@ -334,7 +335,9 @@ static void poll_server() {
   }
 
   bool changed = (seq != lastSeq);
+  bool unreadChanged = (unread != lastUnread);
   lastSeq = seq;
+  lastUnread = unread;
   Serial.printf("[poll] seq=%lu new=%d unread=%lu total=%d every=%lus\n",
                 (unsigned long)seq, isNew, (unsigned long)unread,
                 histTotal, (unsigned long)(pollEvery / 1000));
@@ -356,9 +359,10 @@ static void poll_server() {
     backlight(true);
     draw_card();
     ensure_window();           // 后台补齐相邻
-  } else if (changed && histIdx == 0 && mode != DARK) {
+  } else if ((changed || unreadChanged) && histIdx == 0) {
+    // 列表变化（新邮件/标记已读）：更新窗口 idx=0
     win_put(0, card);
-    draw_card();
+    if (mode != DARK) draw_card();   // 灭屏时只更新缓存，亮屏时重绘
   }
 }
 
